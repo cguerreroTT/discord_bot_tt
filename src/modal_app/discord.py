@@ -1,17 +1,12 @@
-import sqlite3
 import requests
-import os
-from .common import DB_PATH, DEFAULT_LIMIT, volume, get_db_conn, serialize
+from modal_app.common import DB_PATH, DEFAULT_LIMIT, get_db_conn, serialize, client
 from typing import Dict
-from openai import OpenAI
-
 
 DISCORD_BASE_URL = "https://discord.com/api/v10"
 
 def fetch_and_store_channel_messages(channel_id: str, channel_name: str, headers: Dict, limit: int = DEFAULT_LIMIT) -> None:
     """Fetch up to `limit` messages from the given channel and store in SQLite."""
 
-    client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
     url = f"{DISCORD_BASE_URL}/channels/{channel_id}/messages?limit={limit}"
     resp = requests.get(url, headers=headers)
     if resp.status_code == 403:
@@ -29,6 +24,8 @@ def fetch_and_store_channel_messages(channel_id: str, channel_name: str, headers
         INSERT OR REPLACE INTO channel_metadata (channel_id, channel_name)
         VALUES (?, ?)
     """, (channel_id, channel_name))
+
+    print(f"Scraped {len(messages)} messages from channel {channel_name}.")
 
     for msg in messages:
             message_id = msg["id"]

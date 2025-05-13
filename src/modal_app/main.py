@@ -1,18 +1,16 @@
 import sqlite3
 import os
 import json
+import asyncio
 
 from typing import Optional, Dict
-from .discord import DEFAULT_LIMIT
-from modal import asgi_app
-from openai import OpenAI
+from modal import asgi_app, Cron
 from datetime import datetime
-from .discord import scrape_discord_server
 import sqlite_vec
-from sqlite_vec import serialize_float32
 from fastapi import Request
 
-from .common import DB_PATH, VOLUME_DIR, app, fastapi_app, get_db_conn, serialize, volume, TOOLS
+from modal_app.common import DB_PATH, VOLUME_DIR, app, fastapi_app, get_db_conn, serialize, volume, TOOLS, GPT_MODEL, client, DEFAULT_LIMIT
+from modal_app.discord import scrape_discord_server
 
 
 @app.function(
@@ -85,6 +83,37 @@ def fastapi_entrypoint():
     init_db.remote()
     return fastapi_app
 
+
+@app.function(schedule=Cron("0 9 * * *"), volumes={VOLUME_DIR: volume}, timeout=900)  # 5AM EST every day
+def daily_update():
+    """Scrape Discord messages, summarize, and update database."""
+    GUILD_ID = os.environ["GUILD_ID"]
+    LIMIT = 100
+
+    print(f"----- Running daily update cron job (scrape Discord and generate summaries) at {str(datetime.now())} -----")
+
+    # Scrape Discord messages
+    asyncio.run(run_scraping(guild_id=GUILD_ID, limit=LIMIT))
+
+    # Summarize new data
+    volume.reload()
+    asyncio.run(get_channel_summaries(force_refresh=True))
+
+    print("--- Done with daily update. ---")
+
+
+@fastapi_app.post("/login")
+async def authenticate_visitor(request: Request):
+    data = await request.json()
+    pwd = data.get("password")
+
+    CORRECT_PWD = os.environ["STATIC_AUTH_PWD"]
+
+    is_authenticated = pwd == CORRECT_PWD
+
+    return {"authenticated": is_authenticated}
+
+
 @fastapi_app.get("/channel-summaries")
 async def get_summaries(force_refresh: bool = False):
     """
@@ -94,94 +123,6 @@ async def get_summaries(force_refresh: bool = False):
     return await get_channel_summaries(force_refresh=force_refresh)
     volume.commit()
 
-# async def get_channel_summaries():
-#     """Get summaries of all channels for the past week."""
-#     client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
-#     conn = get_db_conn(DB_PATH)
-#     cursor = conn.cursor()
-
-#     excluded_channels = ["customer-whitelabel", "dots-admin"]
-
-#     # Get all unique channels with messages in the last week
-#     channels = cursor.execute(f"""
-#             SELECT DISTINCT dm.channel_id
-#             FROM discord_messages dm
-#             JOIN channel_metadata cm ON dm.channel_id = cm.channel_id
-#             WHERE dm.created_at >= datetime('now', '-7 days')
-#               AND cm.channel_name NOT IN ({','.join(['?'] * len(excluded_channels))})
-#             ORDER BY dm.channel_id
-#         """, excluded_channels).fetchall()
-#     summaries = []
-#     for (channel_id,) in channels:
-#         # Get messages from the last week for this channel
-#         messages = cursor.execute("""
-#             SELECT content, created_at
-#             FROM discord_messages
-#             WHERE channel_id = ?
-#               AND created_at >= datetime('now', '-7 days')
-#             ORDER BY created_at DESC
-#         """, (channel_id,)).fetchall()
-
-#         if not messages:
-#             continue
-
-#         # Prepare messages for summarization
-#         messages_text = "\n".join([f"{msg[0]} ({msg[1]})" for msg in messages])
-
-#         # Generate summary using OpenAI
-#         summary_prompt = f"""Summarize the key discussions and topics from these Discord messages:
-
-#             {messages_text}
-
-#             Provide a concise summary highlighting:
-#             1. Main topics discussed
-#             2. Key decisions or conclusions (if any)
-#             3. Notable activity or events mentioned
-#         """
-
-#         summary_response = client.chat.completions.create(
-#             model="gpt-4o",
-#             messages=[{
-#                 "role": "user",
-#                 "content": summary_prompt
-#             }],
-#             temperature=0.7,
-#             max_tokens=250
-#         )
-
-#         # Get message count and active hours
-#         stats = cursor.execute("""
-#             SELECT
-#                 COUNT(*) as msg_count,
-#                 COUNT(DISTINCT author_id) as unique_authors,
-#                 strftime('%H', created_at) as hour,
-#                 COUNT(*) as hour_count
-#             FROM discord_messages
-#             WHERE channel_id = ?
-#               AND created_at >= datetime('now', '-7 days')
-#             GROUP BY strftime('%H', created_at)
-#             ORDER BY hour_count DESC
-#             LIMIT 1
-#         """, (channel_id,)).fetchone()
-
-#         # Get channel name
-#         channel_name = cursor.execute("""
-#             SELECT DISTINCT channel_name FROM channel_metadata WHERE channel_id = ?
-#         """, (channel_id,)).fetchone()
-
-#         summaries.append({
-#             "channel_id": channel_id,
-#             "channel_name": channel_name[0] if channel_name else "Unknown Channel",
-#             "summary": summary_response.choices[0].message.content,
-#             "message_count": stats[0],
-#             "unique_authors": stats[1],
-#             "most_active_hour": f"{stats[2]}:00",
-#             "peak_hour_messages": stats[3]
-#         })
-
-#     conn.close()
-#     print(summaries)
-#     return {"summaries": summaries}
 
 @fastapi_app.post("/ask")
 async def ask_discord(request: Request):
@@ -191,7 +132,6 @@ async def ask_discord(request: Request):
     2) Generate & execute SQL
     to answer the user’s question.
     """
-    client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
     body = await request.json()
     user_query = body.get("query", "")
 
@@ -227,7 +167,7 @@ async def ask_discord(request: Request):
 
     # 1) Ask the model to call our function
     completion = client.chat.completions.create(
-        model="gpt-4o",
+        model=GPT_MODEL,
         messages=messages,
         tools=TOOLS,
         tool_choice={"type": "function", "function": {"name": "decide_approach"}}
@@ -258,7 +198,7 @@ async def ask_discord(request: Request):
                 }
             )
             final_response = client.chat.completions.create(
-                model="gpt-4o",
+                model=GPT_MODEL,
                 messages=messages,
             )
             messages.append(final_response.choices[0].message)
@@ -284,7 +224,7 @@ async def ask_discord(request: Request):
                 }
             )
             final_response = client.chat.completions.create(
-                model="gpt-4o",
+                model=GPT_MODEL,
                 messages=messages,
             )
             messages.append(final_response.choices[0].message)
@@ -299,8 +239,7 @@ async def ask_discord(request: Request):
             return {"answer": "Unknown approach returned by LLM."}
 
 
-@fastapi_app.post("/discord/{guild_id}")
-async def scrape_server(guild_id: str, limit: int = DEFAULT_LIMIT):
+async def run_scraping(guild_id: str, limit: int = DEFAULT_LIMIT):
     discord_token = os.environ["DISCORD_TOKEN"]
     headers = {
         "Authorization": discord_token,
@@ -311,9 +250,14 @@ async def scrape_server(guild_id: str, limit: int = DEFAULT_LIMIT):
     volume.commit()
     return {"status": "ok", "message": f"Scraped guild_id={guild_id}, limit={limit}"}
 
+
+@fastapi_app.post("/discord/{guild_id}")
+async def scrape_server(guild_id: str, limit: int = DEFAULT_LIMIT):
+    return await run_scraping(guild_id, limit)
+
+
 # @fastapi_app.get("/query/{message}")
 def similarity_search(message: str, top_k: int = 15):
-    client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
     conn = get_db_conn(DB_PATH)
     cursor = conn.cursor()
     query_vec = client.embeddings.create(model="text-embedding-ada-002", input=message).data[0].embedding
@@ -346,7 +290,6 @@ def do_sql_query(sql_query: str):
     Executes the generated SQL and returns the rows.
     """
     print(f"sql query generated: {sql_query}")
-    from .common import get_db_conn
     conn = get_db_conn(DB_PATH)
     cursor = conn.cursor()
 
@@ -373,7 +316,6 @@ async def get_channel_summaries(force_refresh: bool = False) -> Dict:
     """
     Get summaries for all channels, using cache when available unless force_refresh is True.
     """
-    client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
     conn = get_db_conn(DB_PATH)
     cursor = conn.cursor()
 
@@ -427,7 +369,7 @@ async def get_channel_summaries(force_refresh: bool = False) -> Dict:
         # Generate summary using OpenAI
         messages_text = "\n".join([f"{msg[0]} ({msg[1]})" for msg in messages])
         summary_response = client.chat.completions.create(
-            model="gpt-4o",
+            model=GPT_MODEL,
             messages=[{
                 "role": "user",
                 "content": f"""Analyze the following messages from Discord channel '{channel_name}'
@@ -443,6 +385,7 @@ async def get_channel_summaries(force_refresh: bool = False) -> Dict:
                     """
             }],
         )
+        print(f"Done generating summaries for channel {channel_name}")
 
         summary_data = {
             "channel_id": channel_id,
