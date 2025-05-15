@@ -250,7 +250,7 @@ async def ask_discord(request: Request):
 async def run_scraping(guild_id: str, limit: int = DEFAULT_LIMIT):
     discord_token = os.environ["DISCORD_TOKEN"]
     headers = {
-        "Authorization": discord_token,
+        "Authorization": f"Bot {discord_token}",
         "Content-Type": "application/json"
     }
     volume.reload()
