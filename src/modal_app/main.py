@@ -84,7 +84,7 @@ def fastapi_entrypoint():
     return fastapi_app
 
 
-@app.function(schedule=Cron("0 9 * * *"), volumes={VOLUME_DIR: volume}, timeout=900)  # 5AM EST every day
+@app.function(schedule=Cron("0 9 * * *"), volumes={VOLUME_DIR: volume}, timeout=1800)  # 5AM EST every day
 def daily_update():
     """Scrape Discord messages, summarize, and update database."""
     GUILD_ID = os.environ["GUILD_ID"]
@@ -351,20 +351,25 @@ async def get_channel_summaries(force_refresh: bool = False) -> Dict:
         if not messages:
             continue
 
-        # Get channel statistics
-        stats = cursor.execute("""
+        # Count messages and unique authors
+        message_count, author_count = cursor.execute("""
             SELECT
                 COUNT(*) as msg_count,
-                COUNT(DISTINCT author_id) as unique_authors,
-                strftime('%H', created_at) as hour,
-                COUNT(*) as hour_count
+                COUNT(DISTINCT author_id) as unique_authors
             FROM discord_messages
             WHERE channel_id = ?
               AND created_at >= datetime('now', '-7 days')
-            GROUP BY strftime('%H', created_at)
-            ORDER BY hour_count DESC
-            LIMIT 1
         """, (channel_id,)).fetchone()
+
+        # Get peak time and number of messages in that hour
+        peak_hour, peak_hour_messages = cursor.execute("""
+            SELECT strftime('%H', created_at) AS hour, COUNT(*) AS message_count
+            FROM discord_messages
+            WHERE channel_id = ? AND created_at >= datetime('now', '-7 days')
+            GROUP BY hour
+            ORDER BY message_count DESC
+            LIMIT 1;
+            """, (channel_id,)).fetchone()
 
         # Generate summary using OpenAI
         messages_text = "\n".join([f"{msg[0]} ({msg[1]})" for msg in messages])
@@ -391,10 +396,10 @@ async def get_channel_summaries(force_refresh: bool = False) -> Dict:
             "channel_id": channel_id,
             "channel_name": channel_name,
             "summary": summary_response.choices[0].message.content,
-            "message_count": stats[0],
-            "unique_authors": stats[1],
-            "most_active_hour": f"{stats[2]}:00",
-            "peak_hour_messages": stats[3],
+            "message_count": message_count,
+            "unique_authors": author_count,
+            "most_active_hour": f"{peak_hour}:00",
+            "peak_hour_messages": peak_hour_messages,
             "summary_start_date": messages[-1][1],  # First message in time range
             "summary_end_date": messages[0][1],    # Last message in time range
         }
