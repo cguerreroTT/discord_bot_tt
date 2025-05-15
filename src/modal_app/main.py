@@ -138,24 +138,19 @@ async def ask_discord(request: Request):
     if not user_query:
         return {"error": "No query provided."}
 
-    # The system message can instruct the model how to decide.
+    # ----------- ONLY USE RAG FOR NOW UNTIL SQL IS RELIABLE -----------
+    rag_data = similarity_search(user_query)
+
     system_message = {
         "role": "system",
         "content":
-            """
-            You are a helpful assistant. You can answer user questions using either:\n\n
-            1) RAG-based similarity search (when the user wants summarized info from the actual conversation content), OR\n
-            2) Generating a SQL query if the user wants structured data queries.\n\n
-            Please do not mix them. Decide which approach is best for the user's question.\n
-            If you choose SQL, provide a valid SQL SELECT statement that references the 'discord_messages' table.\n
-            here is the schema for the `discord_messages` table that we have:\n
-            discord_messages (
-                        id TEXT PRIMARY KEY,
-                        channel_id TEXT NOT NULL,
-                        author_id TEXT NOT NULL,
-                        content TEXT NOT NULL,
-                        created_at TIMESTAMP NOT NULL
-                    )
+            f"""
+            You are a helpful assistant. \n
+            When answering user questions, use the provided information below to answer the user question accurately.\n
+            Base your responses on the retrieved context, especially for summary or factual queries.\n
+            If the context does not contain the answer, respond honestly that you do not know.
+
+            {str(rag_data)}
             """
     }
 
@@ -164,6 +159,19 @@ async def ask_discord(request: Request):
         "content": user_query
     }
     messages = [system_message, user_message]
+
+    final_response = client.chat.completions.create(
+        model=GPT_MODEL,
+        messages=messages
+    )
+    messages.append(final_response.choices[0].message)
+
+    return {
+        "answer": final_response.choices[0].message.content,
+        "chat_history": messages
+    }
+
+    # TODO - add other tools back in for more advanced reasoning
 
     # 1) Ask the model to call our function
     completion = client.chat.completions.create(
